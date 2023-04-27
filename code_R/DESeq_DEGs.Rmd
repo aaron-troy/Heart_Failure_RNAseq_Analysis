@@ -1,0 +1,360 @@
+---
+title: "Preprocess Heart Failure RNA Seq. Data"
+author: "Aaron Troy"
+date: "2022-10-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### This notebook serves as the first step in making use of the publicly available RNAseq data from heart failure patients made available by the Kass group at Johns Hopkins. 
+
+Tissue samples were collected from the right ventricular septum during heart catherterization. Bulk RNA seq was performed followed by alignment with Ensembl 92. For full details see the publication: Hahn, V. S., Knutsdottir, H., Luo, X., Bedi, K., Margulies, K. B., Haldar, S. M., Stolina, M., Yin, J., Khakoo, A. Y., Vaishnav, J., Bader, J. S., Kass, D. A., & Sharma, K. (2021). Myocardial Gene Expression Signatures in Human Heart Failure with Preserved Ejection Fraction. Circulation, 120–134. https://doi.org/10.1161/CIRCULATIONAHA.120.050498
+
+The objectives of this notebook are as follows. Given the raw counts:
+- Eliminate NAs
+- Eliminate genes associated with red blood cells, if desired
+- Compute and output normalized, variance stabilized counts using DESeq's median of ratio's method and an appropriate transformation
+- Adjust for covariates as desired on a sample-by-sample basis
+- Compute DEG values using DESeq and linear modelling
+- Map the results, both transformed counts and DEG values to external gene ids for downstream use.
+- Export normalized, transformed counts for each sample and DEG values for each group. 
+
+#### Lets start by loading the required libraries and defining some controlling flags 
+
+```{r importLibs}
+suppressMessages(library(biomaRt))
+suppressMessages(library(DESeq2))
+suppressMessages(library(limma))
+suppressMessages(library(dplyr))
+suppressMessages(library(textshape))
+suppressMessages(library(EnhancedVolcano))
+suppressMessages(library(vsn))
+suppressMessages(library(data.table))
+suppressMessages(library(DGEobj.utils))
+suppressMessages(library(GenomicFeatures))
+
+#Method for variance stabilization for normalized counts. Default is log2(x+1). Other options as 'vst' and 'rlog'
+vsMeth <- 'vst'
+
+#Flag to regress out the selected covariates in the transformed counts 
+rgCovs <- FALSE
+
+#Set to false to retain genes tied to RBCs
+removeGenesRBC <- TRUE  
+
+#List of covariates to control for in the normalized counts. NOTE: for the time being, correction for sex is hard-coded downstream. 
+covFlags <- data.frame('age' = TRUE, 'sex' = TRUE, 't2dm' = FALSE, 'bmi' = FALSE, 'eGFR' = FALSE) 
+
+#Flag for continuous covariates. These will be transformed to a normal dist. 
+isCont <- data.frame('age' = TRUE, 'sex' = FALSE, 't2dm' = FALSE, 'bmi' = TRUE, 'eGFR' = TRUE) 
+
+```
+#### Load in the raw sequencing counts and patient data. The later includes all clinical info. Perform some basic conditioning.
+
+- Remove NA values
+- If desired, remove genes strongly tied to RBCs given by a predefined list.  
+
+```{r loadData}
+setwd("~/Bioinformatics/Network Analysis of HFpEF/Hahn_FGN_Analysis/")
+
+sampInfo <- read.csv("data/clinicalData.csv")
+rawCnts <- read.csv("data/RawReads_VS_Ensembl_geneName.csv", check.names = FALSE, header = TRUE) %>%
+  na.omit() %>%
+  column_to_rownames("geneID") %>%
+  as.matrix()
+
+#If selected, eliminate transcripts tied strongly to red blood cells
+if(removeGenesRBC) {
+  
+  #Read in a list of RBC genes to exclude. This come directly from the Hahn et al. publication. 
+  genesRBC <- read.csv("data/ExcludeRBCgenes.csv")
+  
+  #Remove the genes
+  clnCnts <- rawCnts[!(rownames(rawCnts) %in% genesRBC$Ensembl), ]
+}
+
+head(sampInfo)
+head(clnCnts)
+```
+#### Before doing any DEG analysis, we need to performe normalization to account for differing library sizes and compositions. While not required for DEG analsyis using the DESeq pipeline, we will also complete variance stabilization. This will yield counts that can be used for a variety of other downstream analyses (e.g. cliustering). Finally, adjustment of the transformed counts for any flaged covariates will also be completed here.  
+
+##### Normalization
+
+For some downstream analyses, we require some type of sample by sample expression signature, rather than simple L2FC values or other stats between groups. There are a number of confounds that need to be dealt with here before proceeding. 
+
+- Library size and hence total number of reads differs between samples and must be normalized for
+- Differences in the library composition. For example, a gene highly expressed in one sample may be knocked out in another. Reads attributed to this gene in the WT sample will be distributed to others in the KO, which will appear as if many gene are DE, but this is clearly not the case. 
+
+These considerations are addressed by DESeq's standard normalization, which use the median of ratios method to compute a scaling factor for each gene. This is done as follows: 
+1. Take the natural log of each entry
+2. Take the average of these value across each gene ($\text{mean}(\ln(e_i))$)
+4. Subtract this average ln value from the ln of each count $(\ln(a) - \ln(b) = \ln(a/b))$
+5. Calculate the median for each row. I.e., the median log ratio
+6. The scaling factor for each gene is then given by $e$ exponentiation
+7. Divide all counts by this scaling factor for each row
+
+##### Variance stabilization
+
+Within expression datasets the variance in expression for each gene typically displays a high degree of dependence upon the mean expression of the gene. This needs to be corrected for if we wish to perform simple regression, ANOVA, or effect clustering. DESeq provides three possible transformations to complete this 
+
+###### Regularized log transformation:
+
+Very complicated and slow. Takes several minutes to run for ~100 samples. Regularizes using shrinkage. 
+
+###### Log-2 with psudocounts:
+
+By far the simplest approach. Simply take $\log_2(x_{i,j} + x_0)$ for all entries, where $x_{i,j}$ is the count number for gene $i$, sample $j$. $x_0$ is an added pseudo count constant to avoid infinite values.
+
+###### Variance stabilizing:
+
+Estimates a function $y = f(x)$ such that $\text{Var}(Y) \perp\!\!\!\!\perp E(X)$. Assuming $\text{Var}(X) = h(\mu)$, a suitable basis for $y$ is:
+
+
+$$
+y \propto \int_0^x\frac{d\mu}{\sqrt{h(\mu)}}
+$$
+This is the approach suggested in most cases by Michael Love
+
+##### Adjust for covariates (age, sex, batch effects) in the transformed counts 
+
+Adjust for covariates is often essential. The are myriad tools to complete this in R. I like to use the removeBatchEffect function from limma. 
+
+IMPORTANT: Limma wanrs against doing linear modelling after applying removeBatchEffect. You're bettwe off simply including the covariates as terms in your model. On the other hand, if you want to do clustering things should be ok. 
+
+For continuous covariates (BMI, age, eGFR), we will center and scale the data to improve model fitting (see here: https://support.bioconductor.org/p/9138042/). Note the fitted coefficients can converted back to the original scaling by multiplying by the SD of the raw data. 
+
+``` {r normalizationAndVST}
+
+#Setup the covariates you want to adjust for. We do this first in order to build the DESeq object correctly. 
+contCovs <- colnames(covFlags)[as.logical(covFlags * isCont)]     #Continuous covariates
+discCovs <- colnames(covFlags)[as.logical(covFlags * !(isCont))]  #Discrete covariates
+covs <- colnames(covFlags)[as.logical(covFlags)]
+
+if (rgCovs & !isEmpty(covs)){
+  design <-  paste("~ disease", paste(covs, collapse = ' + '), sep = ' + ')
+} else{
+  design <-  "~ disease"
+}
+
+############################################################################################################################
+
+# Build sample info for DESeq. We do a couple things here:
+# - Take only samples that we have RNAseq data for
+# - Take only the clinical identifier, disease, and any covariates includes
+# - Remove any patients for which there is clinical info missing
+# - Zero center and scale any included convariates that are flagged as continuous. 
+sampInfCln <- sampInfo[as.character(sampInfo$id) %in% colnames(clnCnts), colnames(sampInfo) %in% c('id', 'disease', covs)] %>%
+  na.omit() %>% 
+  mutate(across(.cols = contCovs, .fns = scale)) 
+
+# Remove RNAseq data for patients that didn't meet the criteria just applied. 
+clnCnts <- clnCnts[, (colnames(clnCnts) %in% c(as.character(sampInfCln$id)))] 
+
+#Ensure things are arranged in the same order. Maybe this isn't necessary...
+sampInfCln <- arrange(sampInfCln, sapply(id, function(y) which(y == colnames(clnCnts))))
+
+############################################################################################################################
+
+# Make the DESeq object'
+dds <- DESeqDataSetFromMatrix(clnCnts, sampInfCln, design = as.formula(design))
+
+
+############################################################################################################################
+
+#Now let's complete normalization with size factors followed by variance stabilization
+dds <- estimateSizeFactors(dds)
+
+# Check the variance-mean dependence before stabilization
+meanSdPlot(counts(dds, normalized = TRUE))$gg + scale_y_log10()
+
+if (vsMeth == 'vst'){
+  #Perform VST
+  trnsCnts <- varianceStabilizingTransformation(dds, blind = FALSE) 
+  meanSdPlot(assay(trnsCnts))$gg + scale_y_log10()
+} else if(vsMeth == 'rlog'){
+  #Perform regularized log transform. Takes a while
+  trnsCnts <- rlogTransformation(dds, blind = FALSE) 
+  meanSdPlot(assay(trnsCnts))$gg + scale_y_log10()
+} else {
+  trnsCnts <- normTransform(dds)
+  meanSdPlot(assay(trnsCnts))$gg + scale_y_log10()
+}
+
+#Regress out the effects of the selected covariates. For now, sex is included as a discrete covariate by default. 
+if (rgCovs) {
+  
+  mat <- assay(trnsCnts)
+  desMat <- model.matrix(~disease, colData(trnsCnts))
+  adjCnts <- trnsCnts
+  
+  if (!isEmpty(contCovs)) {
+    contCovs <- paste('~ ', paste(contCovs, collapse = ' + '))
+    covMat <- model.matrix(as.formula(paste('~ ', paste(contCovs, collapse = ' + '))), colData(trnsCnts))
+    assay(adjCnts) <- (limma::removeBatchEffect(mat, batch = trnsCnts$sex, covariates = covMat, design = desMat))
+  } else {
+    assay(adjCnts) <- limma::removeBatchEffect(mat, batch = trnsCnts$sex)
+  }
+} else {
+   adjCnts <- trnsCnts
+}
+
+#Check PCA, before and after adjustment, for select covariates
+
+
+if ('age' %in% covs) {
+  print(plotPCA(trnsCnts, intgroup = 'age') + scale_color_gradient2(midpoint=0, low="blue", mid="white", high="red", space ="Lab" )+ theme_bw() + theme(text = element_text(size = 16)) )
+  print(plotPCA(adjCnts, intgroup = 'age') + scale_color_gradient2(midpoint=0, low="blue", mid="white", high="red", space ="Lab" )+ theme_bw() + theme(text = element_text(size = 16)) )
+}
+
+if ('sex' %in% covs){
+  print(plotPCA(trnsCnts, intgroup = 'sex') + theme_bw() + theme(text = element_text(size = 16)))
+  print(plotPCA(adjCnts, intgroup = 'sex') + theme_bw() + theme(text = element_text(size = 16)) )
+}
+
+# Also check separation by disease
+plotPCA(trnsCnts, intgroup = 'disease')+ theme_bw() + theme(text = element_text(size = 16)) 
+plotPCA(adjCnts, intgroup = 'disease') + theme_bw() + theme(text = element_text(size = 16))  
+
+adjCnts <- assay(adjCnts)
+```
+
+
+
+#### Perform DESeq to detect DEGs
+
+Set the transformed counts assigned for the time being to compute the DEGs group by group. This will done using DESeq using a negative bionomial distribution as a prior. A few operations that are applied that you should be aware of: 
+
+- The Cook's distance (see [here](https://en.wikipedia.org/wiki/Cook%27s_distance)) is applied by default to remove outlier genes, using a threshold of the 0.99 quantile if the F distribution. These genes will be flagged in the results by a p-value and adjusted p-value set to NA
+- Similarly, genes will low expression will be removed automatically and result in an adjusted p-value of NA. Not that the p-value will be retained, provided the Cook's distance passes the threshold.  
+- Adjusted p-values are computed using the Benjamini-Hochberg procedure by default, although alternatives can be specified. 
+- An $\alpha$ of 0.1 is used by default as the false discovery rate cutoff. Change this if desired  
+
+
+```{r computeDEGs}
+
+alphaFDR <- 0.05
+
+#Perform DESeq
+dds <- DESeq(dds)
+
+#Get the results and genes flagged (padj set to NA, be default) for low expression of high Cook's distance
+resPEF <- results(dds,tidy = TRUE, contrast = c("disease","HFpEF","Normal"), alpha=alphaFDR) %>%
+  rename_with(function(x) paste0(x, "_PEF"))
+resREF <- results(dds,tidy = TRUE, contrast = c("disease","HFrEF","Normal"), alpha=alphaFDR) %>%
+  rename_with(function(x) paste0(x, "_REF"))
+resPEFREF <- results(dds,tidy = TRUE, contrast = c("disease","HFpEF","HFrEF"), alpha=alphaFDR) %>%
+  rename_with(function(x) paste0(x, "_PEFREF"))
+
+# Compile genes marked as outliers of lowly expressed
+badGenes <-  c(resPEF[is.na(resPEF$padj_PEF), "row_PEF"], resREF[is.na(resREF$padj_REF), "row_REF"], resPEFREF[is.na(resPEFREF$padj_PEFREF), "row_REF"]) %>% unique()
+
+# Assemble the results and discard flagged genes. Add z-scores for each contrast
+resDES <- merge(resPEF, resREF, by.x = 'row_PEF', by.y = "row_REF") %>%
+  merge(resPEFREF, by.x = 'row_PEF', by.y = "row_PEFREF") %>%
+  filter(!(row_PEF %in% badGenes)) %>%
+  rename(geneID = row_PEF) %>%
+  as.data.table()
+
+#Add z-scores. DESeq returns Wald statistics which can also be used
+resDES <- resDES[, z_score_PEF := abs(qnorm(pvalue_PEF/2)) * sign(log2FoldChange_PEF)]
+resDES <- resDES[, z_score_REF := abs(qnorm(pvalue_REF/2)) * sign(log2FoldChange_REF)]
+resDES <- resDES[, z_score_PEFREF := abs(qnorm(pvalue_PEFREF/2)) * sign(log2FoldChange_PEFREF)]
+
+head(resDES)
+
+#Remove flagged genes for low expression or high Cook's distance from the counts themsselves.
+adjCnts <- adjCnts[!(row.names(adjCnts) %in% badGenes), ] %>% as.data.frame()
+
+```
+
+
+#### Almost done. Some post processing and making things more accessible. 
+
+No one has ensembl IDs memorized, so add the external gene names using bioMart. IMPORTANT: you need to use the same version of ensembl that was used during the alignment. 
+
+Even with this, there will be a large number (100 or so) emsembl IDs that map to multiple gene names (multi-mapping, MM). What to do about this will depend on what you're interested in. Certainly, just merging the expression / count values of genes with MM is not principled. Some amount of manual inspection to determine to what to do in each case is often unavoidable if you want to avoid discarding data. 
+
+Further, if all you care about is protein coding genes (what even is short/long/medium/whatever non-coding RNA?), include "gene_biotype" as an attribute in your biomaRt query. You can use this to filter for stuff that actually becomes proteins.
+
+Whatever is left over after this is usually manageable through manual inspection. 
+
+```{r mappingToGeneSymbols}
+
+mart <- useEnsembl(biomart = 'genes', dataset = 'hsapiens_gene_ensembl', version = 92) 
+map <- getBM(filters= "ensembl_gene_id", attributes= c("ensembl_gene_id", "external_gene_name", "gene_biotype"),values=rownames(adjCnts), mart = mart, uniqueRows=T) 
+
+#Take only things that are protein coding and unique
+map <- filter(map, gene_biotype %in% c('protein_coding'))
+map <- map[isUnique(map$external_gene_name), c('external_gene_name', 'ensembl_gene_id')]
+
+
+finalDEGs <- merge(resDES, map, by.x = 'geneID', by.y = "ensembl_gene_id")
+finalCounts <- merge(adjCnts, map, by.x = 'row.names', by.y = "ensembl_gene_id")
+clnCnts_ensembl <- merge(clnCnts, map, by.x = 'row.names', by.y = "ensembl_gene_id")
+
+#Save counts and DEGs, for use elsewhere
+setwd("~/Bioinformatics/Network Analysis of HFpEF/Hahn_FGN_Analysis/")
+
+if (rgCovs){
+  write.csv(finalDEGs, "data/covar_adjusted_DEGs_deseq.csv")
+  write.csv(finalCounts, "data/covar_adjusted_normCounts_deseq.csv")
+   write.csv(adjCnts, "data/covar_adjusted_normCounts_unfilt_deseq.csv")
+} else {
+  write.csv(finalDEGs, "data/unadjusted_DEGs_deseq.csv")
+  write.csv(finalCounts, "data/unadjusted_normCounts_deseq.csv")
+  write.csv(adjCnts, "data/unadjusted_normCounts_unfilt_deseq.csv")
+}
+#Save counts and DEGs, for use elsewhere
+setwd("~/Bioinformatics/Network Analysis of HFpEF/Hahn_FGN_Analysis/")
+
+write.csv(clnCnts_ensembl, "data/unadj_Cnts_RBCfilt_ensembl.csv")
+```
+
+```{r produceTPMCounts}
+
+countToTpm <- function(counts, effLen)
+{
+    rate <- log(counts) - log(effLen)
+    denom <- log(sum(exp(rate)))
+    exp(rate - denom + log(1e6))
+}
+
+```
+
+
+## Volcano plots to highlight highly differntially expressed genes
+```{r Volcano plots, fig.height=10, fig.width=8}
+#HFpEF vs control
+EnhancedVolcano(finalDEGs,
+                     lab = finalDEGs$external_gene_name,
+                     x = 'log2FoldChange_PEF',
+                     y = 'pvalue_PEF', 
+                     title = 'HFpEF vs Control',
+                     pCutoff = 10e-15,
+                     ylim = c(0, 100),
+                    xlim = c(-10, 10))
+
+#HFrEF vs Control
+EnhancedVolcano(finalDEGs,
+                     lab = finalDEGs$external_gene_name,
+                     x = 'log2FoldChange_REF',
+                     y = 'pvalue_REF', 
+                     title = 'HFrEF vs Control',
+                     pCutoff = 10e-15,
+                     ylim = c(0, 100),
+                    xlim = c(-10, 10))
+
+#HFpEF vs HFrEF
+EnhancedVolcano(finalDEGs,
+                     lab = finalDEGs$external_gene_name,
+                     x = 'log2FoldChange_PEFREF',
+                     y = 'pvalue_PEFREF', 
+                     title = 'HFpEF vs HFrEF',
+                     pCutoff = 10e-15,
+                     ylim = c(0, 100),
+                    xlim = c(-10, 10))
+
+```
