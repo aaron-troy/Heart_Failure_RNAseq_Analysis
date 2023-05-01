@@ -1,0 +1,288 @@
+## ----setup------------------------------------------------------------------------------------------------------------------------------------
+knitr::opts_chunk$set(echo = TRUE)
+
+options(warn=-1)
+
+suppressMessages(library(dplyr))
+suppressMessages(library(ggplot2))
+suppressMessages(library(tidyverse))
+suppressMessages(library(biomaRt))
+suppressMessages(library(modelr))
+suppressMessages(library(poolr))
+suppressMessages(library(pheatmap))
+suppressMessages(library(lsa))
+suppressMessages(library(DESeq2))
+suppressMessages(library(GGally))
+
+#Dorothea - transcription factor network
+library(dorothea)
+
+#VIPER - for inferring active TFs
+library(viper)
+
+#Human Protein Atlas
+library(hpar)
+
+#Metric to perform enrichment on. {'z_score', 'log2FoldChange', 'stat'}
+metric = 'z_score'
+
+
+
+## ----getDorothea------------------------------------------------------------------------------------------------------------------------------
+dorotheaPKN <- dorothea::dorothea_hs %>% 
+  dplyr::filter(confidence %in% c("A", "B", "C")) %>%
+  dplyr::select(target, tf, mor) %>%
+  as.data.frame()
+
+n_genes <- dorotheaPKN %>%
+  group_by(tf) %>%
+  summarize(n = n())
+
+ggplot(data=n_genes, aes(x=n)) +
+  geom_density() +
+  theme(text = element_text(size=12)) +
+  xlab('Number of target genes') +
+  ylab('densities') +
+  theme_bw() +
+  theme(legend.position = "none")
+
+#VIPER reguires the PKN as a regulon object. Make this using dorothea
+regulon <- df2regulon(dorotheaPKN)
+
+
+## ----removeNonHeartTFs------------------------------------------------------------------------------------------------------------------------
+data(hpaNormalTissue)
+
+# Querying the HPA requires ensembl IDs. Retrieve these for the TFs in the PKN using biomaRt
+mart <- useEnsembl(biomart = 'genes', dataset = 'hsapiens_gene_ensembl', version = 92) 
+map <- getBM(filters= "external_gene_name", attributes= c("ensembl_gene_id", "external_gene_name", "gene_biotype"),values=dorotheaPKN$tf, mart = mart, uniqueRows=T)  
+
+# Filter for presense in the heart  
+heartTFs <- getHpa(map$ensembl_gene_id) %>%
+  filter(Tissue == "heart muscle") %>%
+  filter(Level != "Not detected")
+dorotheaPKN <- filter(dorotheaPKN, tf %in% heartTFs$Gene.name)
+
+
+
+## ----getDEGData-------------------------------------------------------------------------------------------------------------------------------
+
+setwd('~/Bioinformatics/Network Analysis of HFpEF/Hahn_FGN_Analysis/data')
+
+# Sources for DEG and counts data for TF enrichement 
+DEG_src = "cov_adj_DEGs_deseq.csv"
+cnts_src = "cov_adj_normCounts_deseq.csv"
+
+# DEGs
+degs <- read.csv(DEG_src, check.names = FALSE, sep = ',', row.names = 1)
+
+# Counts  
+cnts <- read.csv(cnts_src, check.names = FALSE, sep = ',', row.names = 1)%>%
+  as.tibble()%>%
+  column_to_rownames('external_gene_name') %>%
+  dplyr::select(!c('Row.names'))
+
+#Phenotype data
+pData <- read.csv("clinicalData.csv", check.names=FALSE) %>%
+  filter(id %in% colnames(cnts)) %>%
+  arrange(match(id, (colnames(cnts)))) %>%
+  column_to_rownames("id")
+
+head(pData)
+
+#Assemble as expression set object for sample_by_sample analysis 
+exp_dset <- ExpressionSet(assayData = as.matrix(cnts),
+                          phenoData = AnnotatedDataFrame(pData))
+                          
+
+
+
+## ----msVIPER_DEGs-----------------------------------------------------------------------------------------------------------------------------
+#Build an expression matrix using results from DESeq
+expMatrix <- dplyr::select(degs, c(paste0(metric, c('_PEF', '_REF', '_PEFREF'))))
+row.names(expMatrix) <- degs$external_gene_name
+
+#Generate a null model 
+perms <- permute(as.data.frame(t(expMatrix)),  1000)$perm
+nullModel <- as.data.frame(t(perms))
+
+#Minimum number of target genes required to consider a regulon
+minRegSize = 10
+
+#Perform msVIPER for all three contrast using the desired metric (l2FC, z-score, or Wald statistic) A few parameters of relevance: 
+# - minsize = minimum number of gene in a regulon for it to be included in the analysis
+# - pleiotropy = if true, the NES for each regulon is penalized for a regulon's overlap with others
+
+# Follow msVIPER with shawdow and leading edge anlysis 
+
+resPEF <- msviper(as.matrix(expMatrix[paste0(metric, '_PEF')]), regulon, minsize = minRegSize, pleiotropy = TRUE, verbose = FALSE) %>%
+  shadow() %>% ledge() 
+
+resREF <-  msviper(as.matrix(expMatrix[paste0(metric, '_REF')]), regulon, minsize = minRegSize, pleiotropy = TRUE, verbose = FALSE) %>%
+  shadow() %>% ledge() 
+
+resPEFREF <-  msviper(as.matrix(expMatrix[paste0(metric, '_PEFREF')]), regulon, minsize = minRegSize, pleiotropy = TRUE, verbose = FALSE) %>%
+  shadow() %>% ledge() 
+
+
+#Build summary dataframes
+resREF_sum <- data.frame('score' = resREF$es$nes, 'name' = names(resREF$es$nes), 'p_value' = resREF$es$p.value, 'p_adj' = p.adjust(resREF$es$p.value,method = 'fdr'))
+resPEF_sum <- data.frame('score' = resPEF$es$nes, 'name' = names(resPEF$es$nes), 'p_value' = resPEF$es$p.value, 'p_adj' = p.adjust(resPEF$es$p.value, method = 'fdr'))
+resPEFREF_sum <- data.frame('score' = resPEFREF$es$nes, 'name' = names(resPEFREF$es$nes), 'p_value' = resPEFREF$es$p.value, 'p_adj' = p.adjust(resPEFREF$es$p.value,method = 'fdr'))
+
+#Build a summary table
+resAll_sum <-  inner_join(resPEF_sum, resREF_sum, by = 'name', suffix = c('_PEF', '_REF')) %>% 
+  inner_join(resPEFREF_sum, by = 'name') %>%
+  dplyr::rename(score_PEFREF = score, p_value_PEFREF = p_value) %>%
+  as.tibble() %>%
+  add_column('PEF_cos_sim' = NA, 'REF_cos_sim' = NA, 'nes_composite_PEF' = NA, 'nes_composite_REF' = NA)
+
+
+regMat <- filter(dorotheaPKN, tf %in% resAll_sum$name) %>%
+  dplyr::rename(name = target) %>%
+  inner_join(rownames_to_column(expMatrix, 'name'), by = 'name')
+
+
+
+## ----cosSimilarity----------------------------------------------------------------------------------------------------------------------------
+
+for (i in (1:length(resAll_sum$name))){
+  
+  reg = resAll_sum$name[i]
+  
+  Ep = resAll_sum$score_PEF[i]
+  Er = resAll_sum$score_REF[i]
+  Epr = resAll_sum$score_PEFREF[i]
+  
+  pEF_id = paste0(metric, '_PEF')
+  rEF_id = paste0(metric, '_REF')
+  pEF_rEF_id = paste0(metric, '_PEFREF')
+  
+  cos_sim <- filter(regMat, tf == reg) %>%
+    dplyr::select(pEF_id, rEF_id, pEF_rEF_id) %>%
+    as.matrix() %>% 
+    cosine() %>%
+    abs()
+  
+  resAll_sum$PEF_cos_sim[i] = cos_sim[pEF_rEF_id, pEF_id]
+  resAll_sum$REF_cos_sim[i] = -cos_sim[pEF_rEF_id, rEF_id]
+  
+  resAll_sum$nes_composite_PEF[i] <- cos_sim[pEF_rEF_id, pEF_id] * ((Ep) + (Epr)) / 2
+  resAll_sum$nes_composite_REF[i]  <- cos_sim[pEF_rEF_id, rEF_id] * ((Er) - (Epr)) / 2
+  
+}
+
+#Build unique metric dataframes
+resPEF_nesc <- data.frame('score' =  resAll_sum$nes_composite_PEF, 'name' = resAll_sum$name, 'p_adj' = (resAll_sum$p_adj_PEF + resAll_sum$p_adj))
+resREF_nesc <- data.frame('score' =  resAll_sum$nes_composite_REF, 'name' = resAll_sum$name)
+
+
+
+## ----plottingTF_1-----------------------------------------------------------------------------------------------------------------------------
+
+# Make a helper function for the standard top TF plot
+
+plotTopTFs <- function (res, topN = 20, title = NULL) {
+    res <- arrange(res, desc(abs(score))) %>%
+    dplyr::slice(1:topN)
+  
+   if (is.null(title)){
+    title <- sprintf("Top %d Enriched Transcription Factors", topN)
+   } else {
+    title <- paste(sprintf("Top %d Enriched Transcription Factors -", topN), title)
+  }
+  
+  ggplot(dplyr::select(res, c('name', 'score', 'p_adj'))) + 
+      geom_bar(aes(x = reorder(name, (score)), y = score, fill = -log10(p_adj)), stat = "identity") +
+    scale_fill_gradient2(name="-Log(Adj. p-value)", low = "darkblue", high = "steelblue1", 
+        mid = "dodgerblue3", midpoint = (max(-log10(res$p_adj)) - min(-log10(res$p_adj))) / 2 + min(-log10(res$p_adj))) + 
+    theme_minimal() +
+    theme(axis.title = element_text(face = "bold", size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1, size =10, face= "bold"),
+    axis.text.y = element_text(size =10, face= "bold"),
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank()) +
+    xlab(title) + 
+    ylab('Enrichment Score')
+}
+
+#Plot for each contrast
+plotTopTFs(resPEF_sum, title = 'HFpEF vs Control')
+plotTopTFs(resREF_sum, title = 'HFrEF vs Control')
+plotTopTFs(resPEFREF_sum, title = 'HFpEF vs HFrEF')
+
+#Plot for "unique" metrics
+plotTopTFs(resPEF_nesc, title = 'HFpEF - Cosine Composite NES')
+
+
+setwd('~/Bioinformatics/Network Analysis of HFpEF/Hahn_FGN_Analysis/data')
+
+#Update the names of the output, add z_scores
+names(resAll_sum)[names(resAll_sum) == 'name'] <- 'external_gene_name'
+resAll_sum$z_score_PEF = abs(qnorm(resAll_sum$p_value_PEF)) * sign(resAll_sum$score_PEF)
+resAll_sum$z_score_REF = abs(qnorm(resAll_sum$p_value_REF)) * sign(resAll_sum$score_REF)
+resAll_sum$z_score_PEFREF = abs(qnorm(resAll_sum$p_value_PEFREF)) * sign(resAll_sum$score_PEFREF)
+
+#Save the results
+write.csv(resAll_sum, paste0(metric, 'TF_enrichment.csv'), row.names = FALSE) 
+
+
+
+## ----sample_by_sample_VIPER-------------------------------------------------------------------------------------------------------------------
+
+vpsig <- viperSignature(exp_dset, 'disease', 'Normal', per = 1000)
+
+vpres <- viper(vpsig, regulon, verbose = TRUE, minsize = 10)
+
+pos <- pData(vpres)[["disease"]] %in% c("HFpEF", "HFrEF", "Normal")
+res_viper <- t(exprs(vpres)[, pos]) %>%
+  as.data.frame() 
+
+#Pickup the clinical correlates to compare to TF enrichment
+res_viper['Disease'] <- pData(vpres)[["disease"]]
+res_viper['BMI'] <- pData(vpres)[["bmi"]] 
+res_viper['T2DM'] <- pData(vpres)[["diabetes"]]
+res_viper['Age'] <- pData(vpres)[["age"]]
+res_viper['Sex'] <- pData(vpres)[["sex"]]
+res_viper['eGFR'] <- pData(vpres)[["eGFR"]]
+
+write.csv(res_viper, 'samplewise_TF_enrichment.csv', row.names = FALSE) 
+
+
+## ----correlations-----------------------------------------------------------------------------------------------------------------------------
+
+
+# Patient difference heat map
+d1 <- exprs(vpres)[, pos]
+colnames(d1) <- pData(vpres)[["Disease"]][pos]
+dd <- dist(t(d1), method = "euclidean")
+heatmap(as.matrix(dd), Rowv = as.dendrogram(hclust(dd, method = "average")), symm = T)
+
+myColors <- c("#ffb3ba", "#ffffba")
+
+
+# IRF3 - TF enrichment correlations
+ggplot(res_viper, aes(x=BMI, y=IRF3)) +
+  geom_point(aes(color = Disease, shape = Sex), size = 3.25) + 
+  geom_smooth(method= lm, fullrange = TRUE)
+
+ggpairs(res_viper, columns = c('IRF3', 'BMI', 'eGFR', 'Age'), alpha = 1, ggplot2::aes(colour=Disease, alpha = 0.9)) 
+
+#IRF3 - expression correlations
+cnts_plot <- t(exp_dset@assayData$exprs) %>%
+  as.data.frame() %>%
+  dplyr::select(IRF3)
+cnts_plot['Disease'] <- exp_dset$disease
+cnts_plot['BMI'] <- exp_dset$bmi
+cnts_plot['T2DM'] <- exp_dset$diabetes
+cnts_plot['Age'] <- exp_dset$age
+cnts_plot['Sex'] <- exp_dset$sex
+cnts_plot['eGFR'] <- exp_dset$eGFR
+
+ggplot(cnts_plot, aes(x=BMI, y=IRF3)) +
+  geom_point(aes(color = Disease, shape = Sex), size = 3.25) + 
+  geom_smooth(method= lm, fullrange = TRUE)
+
+ggpairs(cnts_plot, columns = c('BMI', 'eGFR', 'Age','IRF3'), alpha = 1, ggplot2::aes(colour=Disease, alpha = 0.9)) 
+
+
