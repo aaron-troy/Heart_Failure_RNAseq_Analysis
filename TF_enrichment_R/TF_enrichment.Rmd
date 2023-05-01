@@ -48,7 +48,7 @@ metric = 'z_score'
 
 ```
 
-#### Retrieve a high confidence prior knowledge human TF network (PKN) from doRothea
+## Retrieve Transcription Factor Network 
 
 Here we select only links with A, B, or C grade confidence. See doRothea documentation to see how these categories are defined.  
 
@@ -76,7 +76,7 @@ ggplot(data=n_genes, aes(x=n)) +
 regulon <- df2regulon(dorotheaPKN)
 ```
 
-#### Use the human protein atlas to remove any TFs not present in the heart
+## Filter TFs using the Human Protein Atlas 
 ```{r removeNonHeartTFs}
 data(hpaNormalTissue)
 
@@ -92,7 +92,7 @@ dorotheaPKN <- filter(dorotheaPKN, tf %in% heartTFs$Gene.name)
 
 ```
 
-#### Read in the preprocessed data
+## Read in Data
 
 Read the DE results from DESeq2  
 
@@ -127,7 +127,7 @@ exp_dset <- ExpressionSet(assayData = as.matrix(cnts),
                           
 
 ```
-#### Now we can run msVIPER for TF enrichment on the DEG data  
+## msVIPER for TF Enrichment 
 
 msVIPER works by computing a three tailed enrichment score. The routine can be summarized through the following steps:
 
@@ -205,7 +205,7 @@ regMat <- filter(dorotheaPKN, tf %in% resAll_sum$name) %>%
 
 ```
 
-#### Compute the cosine similarity to get composite measure of regulons unique to HFpEF
+## Compute Cosine Composite Enrichment Score
 
 To combine information between different contrasts and produce a composite enrichement score ($CES$), we will use the cosine similarity. Essentially we are accounting for how similar / different the enrichment of a given regulon is as opposed to adding the ES naively. 
 
@@ -248,7 +248,7 @@ resREF_nesc <- data.frame('score' =  resAll_sum$nes_composite_REF, 'name' = resA
 ```
 
 
-#### Inspect the results with a few plots of the top TFs for each contrast
+## Results Plotting
 
 ```{r plottingTF_1}
 
@@ -301,7 +301,7 @@ write.csv(resAll_sum, paste0(metric, 'TF_enrichment.csv'), row.names = FALSE)
 ```
 
 
-## Switch gears and now perform the same analysis, but sample by sample
+## Samplewise Analysis
 
 This allows us to extract correlations between TF enrichment and clinical characteristics. 
 
@@ -325,7 +325,9 @@ res_viper['eGFR'] <- pData(vpres)[["eGFR"]]
 
 write.csv(res_viper, 'samplewise_TF_enrichment.csv', row.names = FALSE) 
 ```
-## For IRF3 specifically, compute correlations for both the enrichment score and exression with clinical covariates
+## IRF3 Activity Correlations with Clinical Characteristics 
+
+For IRF3 specifically, compute correlations for both the enrichment score and exression with clinical covariates
 
 IRF3 is the top enriched TF for HFpEF using the cosine composite enrichment score. Let's examine this a bit closer by looking for correlations against given clinical covariates. 
 
