@@ -1,7 +1,7 @@
 ---
 title: "Preprocess Heart Failure RNA Seq. Data"
 author: "Aaron Troy"
-date: "2022-10-12"
+date: "2022-05-01"
 output:
   pdf_document: default
   html_document: default
@@ -143,8 +143,6 @@ if (rgCovs & !isEmpty(covs)){
   design <-  "~ disease"
 }
 
-############################################################################################################################
-
 # Build sample info for DESeq. We do a couple things here:
 # - Take only samples that we have RNAseq data for
 # - Take only the clinical identifier, disease, and any covariates includes
@@ -160,13 +158,8 @@ clnCnts <- clnCnts[, (colnames(clnCnts) %in% c(as.character(sampInfCln$id)))]
 #Ensure things are arranged in the same order. Maybe this isn't necessary...
 sampInfCln <- arrange(sampInfCln, sapply(id, function(y) which(y == colnames(clnCnts))))
 
-############################################################################################################################
-
 # Make the DESeq object'
 dds <- DESeqDataSetFromMatrix(clnCnts, sampInfCln, design = as.formula(design))
-
-
-############################################################################################################################
 
 #Now let's complete normalization with size factors followed by variance stabilization
 dds <- estimateSizeFactors(dds)
@@ -297,7 +290,6 @@ map <- map[isUnique(map$external_gene_name), c('external_gene_name', 'ensembl_ge
 
 finalDEGs <- merge(resDES, map, by.x = 'geneID', by.y = "ensembl_gene_id")
 finalCounts <- merge(adjCnts, map, by.x = 'row.names', by.y = "ensembl_gene_id")
-clnCnts_ensembl <- merge(clnCnts, map, by.x = 'row.names', by.y = "ensembl_gene_id")
 
 #Save counts and DEGs, for use elsewhere
 setwd("~/Bioinformatics/Network Analysis of HFpEF/Hahn_FGN_Analysis/")
@@ -309,10 +301,6 @@ if (rgCovs){
   write.csv(finalDEGs, "data/DEGs_deseq.csv")
   write.csv(finalCounts, "data/normCounts_deseq.csv")
 }
-#Save counts and DEGs, for use elsewhere
-setwd("~/Bioinformatics/Network Analysis of HFpEF/Hahn_FGN_Analysis/")
-
-write.csv(clnCnts_ensembl, "data/unadj_Cnts_RBCfilt_ensembl.csv")
 ```
 
 ## Volcano plots to highlight highly differntially expressed genes
