@@ -2,7 +2,9 @@
 title: "Preprocess Heart Failure RNA Seq. Data"
 author: "Aaron Troy"
 date: "2022-10-12"
-output: html_document
+output:
+  pdf_document: default
+  html_document: default
 ---
 
 ```{r setup, include=FALSE}
@@ -36,11 +38,13 @@ suppressMessages(library(data.table))
 suppressMessages(library(DGEobj.utils))
 suppressMessages(library(GenomicFeatures))
 
+options(warn=-1)
+
 #Method for variance stabilization for normalized counts. Default is log2(x+1). Other options as 'vst' and 'rlog'
 vsMeth <- 'vst'
 
 #Flag to regress out the selected covariates in the transformed counts 
-rgCovs <- FALSE
+rgCovs <- TRUE
 
 #Set to false to retain genes tied to RBCs
 removeGenesRBC <- TRUE  
@@ -248,14 +252,14 @@ resREF <- results(dds,tidy = TRUE, contrast = c("disease","HFrEF","Normal"), alp
 resPEFREF <- results(dds,tidy = TRUE, contrast = c("disease","HFpEF","HFrEF"), alpha=alphaFDR) %>%
   rename_with(function(x) paste0(x, "_PEFREF"))
 
-# Compile genes marked as outliers of lowly expressed
+# Compile genes marked as outliers oR lowly expressed
 badGenes <-  c(resPEF[is.na(resPEF$padj_PEF), "row_PEF"], resREF[is.na(resREF$padj_REF), "row_REF"], resPEFREF[is.na(resPEFREF$padj_PEFREF), "row_REF"]) %>% unique()
 
 # Assemble the results and discard flagged genes. Add z-scores for each contrast
 resDES <- merge(resPEF, resREF, by.x = 'row_PEF', by.y = "row_REF") %>%
   merge(resPEFREF, by.x = 'row_PEF', by.y = "row_PEFREF") %>%
   filter(!(row_PEF %in% badGenes)) %>%
-  rename(geneID = row_PEF) %>%
+  dplyr::rename(geneID = row_PEF) %>%
   as.data.table()
 
 #Add z-scores. DESeq returns Wald statistics which can also be used
@@ -299,31 +303,17 @@ clnCnts_ensembl <- merge(clnCnts, map, by.x = 'row.names', by.y = "ensembl_gene_
 setwd("~/Bioinformatics/Network Analysis of HFpEF/Hahn_FGN_Analysis/")
 
 if (rgCovs){
-  write.csv(finalDEGs, "data/covar_adjusted_DEGs_deseq.csv")
-  write.csv(finalCounts, "data/covar_adjusted_normCounts_deseq.csv")
-   write.csv(adjCnts, "data/covar_adjusted_normCounts_unfilt_deseq.csv")
+  write.csv(finalDEGs, "data/cov_adj_DEGs_deseq.csv")
+  write.csv(finalCounts, "data/cov_adj_normCounts_deseq.csv")
 } else {
-  write.csv(finalDEGs, "data/unadjusted_DEGs_deseq.csv")
-  write.csv(finalCounts, "data/unadjusted_normCounts_deseq.csv")
-  write.csv(adjCnts, "data/unadjusted_normCounts_unfilt_deseq.csv")
+  write.csv(finalDEGs, "data/DEGs_deseq.csv")
+  write.csv(finalCounts, "data/normCounts_deseq.csv")
 }
 #Save counts and DEGs, for use elsewhere
 setwd("~/Bioinformatics/Network Analysis of HFpEF/Hahn_FGN_Analysis/")
 
 write.csv(clnCnts_ensembl, "data/unadj_Cnts_RBCfilt_ensembl.csv")
 ```
-
-```{r produceTPMCounts}
-
-countToTpm <- function(counts, effLen)
-{
-    rate <- log(counts) - log(effLen)
-    denom <- log(sum(exp(rate)))
-    exp(rate - denom + log(1e6))
-}
-
-```
-
 
 ## Volcano plots to highlight highly differntially expressed genes
 ```{r Volcano plots, fig.height=10, fig.width=8}
