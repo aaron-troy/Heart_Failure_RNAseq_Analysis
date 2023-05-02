@@ -7,13 +7,14 @@ output:
   html_document: default
 ---
 
-## Transcription Factor Enrichment for Individual Patients Using VIPER and prior knowledge of transcription factor regulatory relationships 
+#### Transcription Factor Enrichment for Individual Patients Using VIPER and prior knowledge of transcription factor regulatory relationships 
 
-#### The purpose of this notebook is to leverage prior knowledge on transcription factor --> target gene relatioships to rank which TFs are most likley implicated in observed expression profiles. Here, this is done in a groupwise fashion, rather than sample-by-sample. 
+The purpose of this notebook is to leverage prior knowledge on transcription factor --> target gene relatioships to rank which TFs are most likley implicated in observed expression profiles. Here, this is done in a groupwise fashion, rather than sample-by-sample. 
+
 
 To do this, we require the following:
 
-- Expression signatures associated with one or more conditions of interest. These can be simply normalized counts or the results of DEGs analsysis, as in the case here. We will use the DESeq results with 3 paired contrasts between control, HFpEF, and HFrEF
+- Expression signatures associated with one or more conditions of interest. These can be simply normalized counts or the results of DEGs analysis, as in the case here. We will use the DESeq results with 3 paired contrasts between control, HFpEF, and HFrEF
 - A prior knowledge network of TF-->gene relationships. These should be signed and included some confidence score. May databases exist for this. Here, we will use Dorothea (https://saezlab.github.io/dorothea/) with a threshold applied to select only high confidence interactions ]
 - A statistical method for computing an enrichment score. For this, we use VIPER (https://bioconductor.org/packages/release/bioc/html/viper.html)
 
@@ -296,7 +297,7 @@ resAll_sum$z_score_REF = abs(qnorm(resAll_sum$p_value_REF)) * sign(resAll_sum$sc
 resAll_sum$z_score_PEFREF = abs(qnorm(resAll_sum$p_value_PEFREF)) * sign(resAll_sum$score_PEFREF)
 
 #Save the results
-write.csv(resAll_sum, paste0(metric, 'TF_enrichment.csv'), row.names = FALSE) 
+write.csv(resAll_sum, paste0(metric, '_TF_enrichment.csv'), row.names = FALSE) 
 
 ```
 
@@ -323,7 +324,9 @@ res_viper['Age'] <- pData(vpres)[["age"]]
 res_viper['Sex'] <- pData(vpres)[["sex"]]
 res_viper['eGFR'] <- pData(vpres)[["eGFR"]]
 
-write.csv(res_viper, 'samplewise_TF_enrichment.csv', row.names = FALSE) 
+# Save results
+setwd('~/Bioinformatics/Network Analysis of HFpEF/Hahn_FGN_Analysis/data')
+write.csv(res_viper, paste0(metric, '_samplewise_TF_enrichment.csv'), row.names = FALSE) 
 ```
 ## IRF3 Activity Correlations with Clinical Characteristics 
 
