@@ -93,7 +93,7 @@ def get_path_costs(seeds, adj_list, print_prog=False, sampled_proportion = 1):
     try:
         assert sampled_proportion > 0
         assert sampled_proportion <= 1
-    except AssertionError:
+    except AssertionError as err:
         print("Sampled proportion must be in (0, 1]")
         return None
 
@@ -122,9 +122,9 @@ def get_path_costs(seeds, adj_list, print_prog=False, sampled_proportion = 1):
         # Tr
         try:
             path_costs[(home, dest)] = nx.dijkstra_path_length(G, home, dest, weight="cost")
-        except NetworkXNoPath:
+        except (nx.NetworkXNoPath, nx.NodeNotFound) as err:
             # If home/dest are not connected, continue
-            continue
+            pass
         i = i + 1
 
     return path_costs
@@ -187,7 +187,7 @@ def convert_to_string_id(genes, map_path):
     return string_ids
 
 
-def get_network_details(G: networkx, atts: list=[], sort_by: bool=False):
+def get_network_details(G: nx, atts: list=[], sort_by: bool=False):
     """
     Function to produce a summary DF containing centrality measures and Louvain cluster annotation
     Args:
